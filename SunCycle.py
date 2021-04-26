@@ -1,21 +1,8 @@
 import sublime
-from datetime import datetime,timedelta
+import subprocess
 from os import path
-import calendar,json
 
-import urllib.request as urllib
-from .sun import Sun
-from .timezone import FixedOffset,UTC
-
-from .package_control_download_wrapper import fetch
-
-INTERVAL = 0.3 # interval in minutes to do new cycle check
-
-TZ_URL = 'https://maps.googleapis.com/maps/api/timezone/json?location={0[latitude]},{0[longitude]}&timestamp={1}&sensor=false'
-TZ_CACHE_LIFETIME = timedelta(days=1)
-
-IP_URL = 'https://freegeoip.net/json/'
-IP_CACHE_LIFETIME = timedelta(days=1)
+INTERVAL = 5 # interval in seconds to do new cycle check
 
 PACKAGE = path.splitext(path.basename(__file__))[0]
 
@@ -26,84 +13,8 @@ class Settings():
     def __init__(self, onChange=None):
         self.loaded = False
         self.onChange = onChange
-        self.sun = None
-        self.coordinates = None
-        self.timezone = None
 
         self.load()
-
-    def _needsIpCacheRefresh(self, datetime):
-        if not self._ipcache:
-            return True
-
-        return self._ipcache['date'] < (datetime - IP_CACHE_LIFETIME)
-
-    def _needsTzCacheRefresh(self, datetime):
-        if not self._tzcache:
-            return True
-
-        if self._tzcache['fixedCoordinates'] != self.fixedCoordinates:
-            return True
-
-        if self._tzcache['coordinates'] != self.coordinates:
-            return True
-
-        return self._tzcache['date'] < (datetime - TZ_CACHE_LIFETIME)
-
-    def _callJsonApi(self, url):
-        try:
-            # on Linux the embedded Python has no SSL support, so we use Package Control's downloader
-            return json.loads(fetch(url).decode('utf-8'))
-        except Exception as err:
-            logToConsole(err)
-            logToConsole('Failed to get a result from {0}'.format(url))
-
-    def _getIPData(self):
-        return self._callJsonApi(IP_URL)
-
-    def _getTimezoneData(self, timestamp):
-        return self._callJsonApi(TZ_URL.format(self.coordinates, timestamp))
-
-    def getSun(self):
-        if self.fixedCoordinates:
-            # settings contain fixed values
-            if not self.sun:
-                self.sun = Sun(self.coordinates)
-            return self.sun
-
-        now = datetime.utcnow()
-        try:
-            if self._needsIpCacheRefresh(now):
-                result = self._getIPData()
-                self._ipcache = {'date': now}
-                if 'latitude' in result and 'longitude' in result:
-                    self.coordinates = {'latitude': result['latitude'], 'longitude': result['longitude']}
-                    logToConsole('Using location [{0[latitude]}, {0[longitude]}] from IP lookup'.format(self.coordinates))
-                    self.sun = Sun(self.coordinates)
-        except TypeError:
-            # Greenwich coordinates
-            self.coordinates = {'latitude': 51.2838, 'longitude': 0}
-            logToConsole('Using location [{0[latitude]}, {0[longitude]}] from Greenwich'.format(self.coordinates))
-            self.sun = Sun(self.coordinates)
-
-        if (self.sun):
-            return self.sun
-        else:
-            raise KeyError('SunCycle: no coordinates')
-
-    def getTimeZone(self):
-        now = datetime.utcnow()
-
-        if self._needsTzCacheRefresh(now):
-            result = self._getTimezoneData(calendar.timegm(now.timetuple()))
-            self._tzcache = {'date': now, 'fixedCoordinates': self.fixedCoordinates, 'coordinates': self.coordinates}
-            if result and 'timeZoneName' in result:
-                self.timezone = FixedOffset((result['rawOffset'] + result['dstOffset']) / 60, result['timeZoneName'])
-            else:
-                self.timezone = UTC()
-            logToConsole('Using {0}'.format(self.timezone.tzname()))
-
-        return self.timezone
 
     def load(self):
         settings = self._sublimeSettings = sublime.load_settings(PACKAGE + '.sublime-settings')
@@ -116,41 +27,30 @@ class Settings():
         if not settings.has('night'):
             raise KeyError('SunCycle: missing night setting')
 
-        self._tzcache = None
-        self._ipcache = None
-
         self.day = settings.get('day')
         self.night = settings.get('night')
-
-        self.fixedCoordinates = False
-        if settings.has('latitude') and settings.has('longitude'):
-            self.fixedCoordinates = True
-            self.coordinates = {'latitude': settings.get('latitude'), 'longitude': settings.get('longitude')}
-            logToConsole('Using location [{0[latitude]}, {0[longitude]}] from settings'.format(self.coordinates))
-
-        sun = self.getSun()
-        now = datetime.now(tz=self.getTimeZone())
-        logToConsole('Sunrise at {0}'.format(sun.sunrise(now)))
-        logToConsole('Sunset at {0}'.format(sun.sunset(now)))
 
         if self.loaded and self.onChange:
             self.onChange()
 
         self.loaded = True
+
     def unload(self):
         self._sublimeSettings.clear_on_change(PACKAGE)
         self.loaded = False
 
+
 class SunCycle():
     def __init__(self):
-        self.dayPart = None
         self.halt = False
         sublime.set_timeout(self.start, 500) # delay execution so settings can load
 
     def getDayOrNight(self):
-        sun = self.settings.getSun()
-        now = datetime.now(tz=self.settings.getTimeZone())
-        return 'day' if now >= sun.sunrise(now) and now <= sun.sunset(now) else 'night'
+        """Checks DARK/LIGHT mode of macos."""
+        cmd = 'defaults read -g AppleInterfaceStyle'
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, shell=True)
+        return 'night' if bool(p.communicate()[0]) else 'day'
 
     def cycle(self):
         sublimeSettings = sublime.load_settings('Preferences.sublime-settings')
@@ -183,7 +83,7 @@ class SunCycle():
 
     def loop(self):
         if not self.halt:
-            sublime.set_timeout(self.loop, INTERVAL * 60000)
+            sublime.set_timeout(self.loop, INTERVAL * 1000)
             self.cycle()
 
     def stop(self):
